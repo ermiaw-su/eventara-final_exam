@@ -1,0 +1,1103 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>Eventara</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    /*
+    =====================================================================
+    EVENTARA — Mobile Event & Seminar App
+    Frontend for Mobile Web Service & API Final Exam
+
+    REQUIRED API CONTRACT (students must implement exactly):
+      POST   /api/register          body: { name, email, password }         → { token, user: { id, name, email } }
+      POST   /api/login             body: { email, password }               → { token, user: { id, name, email } }
+      GET    /api/events                                                    → [ { id, title, description, date, location, category, capacity, available_seats, price } ]
+      GET    /api/events/:id                                                → { id, title, description, date, location, category, capacity, available_seats, price }
+      POST   /api/events/:id/book   header: Authorization Bearer <token>   → { booking_id, status: "pending" }
+      GET    /api/bookings          header: Authorization Bearer <token>    → [ { id, status, event: { title, date, location }, created_at } ]
+      GET    /api/bookings/:id      header: Authorization Bearer <token>    → { id, status, event: { title, date, location }, created_at }
+
+    ERROR FORMAT:  { "error": "message" }
+    STATUS VALUES: "pending" | "confirmed" | "failed" | "cancelled"
+
+    REQUIRED MIDDLEWARE:
+      - CORS headers (Access-Control-Allow-Origin: *)
+      - Authentication middleware for protected routes
+      - Rate limiting middleware
+
+    WORKER POOL:
+      - POST /api/events/:id/book enqueues a job and returns "pending"
+      - A goroutine worker pool processes the job asynchronously
+      - GET /api/bookings/:id reflects the updated status once processed
+    =====================================================================
+    */
+
+    * { -webkit-tap-highlight-color: transparent; box-sizing: border-box; }
+
+    body {
+      font-family: 'Inter', sans-serif;
+      max-width: 430px;
+      margin: 0 auto;
+      min-height: 100vh;
+      background: #FAFAF9;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    /* ── Screens ── */
+    .screen { display: none; min-height: 100vh; flex-direction: column; }
+    .screen.active { display: flex; }
+
+    /* ── Animations ── */
+    @keyframes fadeUp {
+      from { opacity: 0; transform: translateY(10px); }
+      to   { opacity: 1; transform: translateY(0); }
+    }
+    @keyframes slideUp {
+      from { opacity: 0; transform: translateY(100%); }
+      to   { opacity: 1; transform: translateY(0); }
+    }
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+    @keyframes pulseRing {
+      0%   { transform: scale(0.85); opacity: 1; }
+      100% { transform: scale(1.5);  opacity: 0; }
+    }
+
+    .anim-fade-up  { animation: fadeUp  0.3s cubic-bezier(0.16,1,0.3,1) both; }
+    .anim-slide-up { animation: slideUp 0.4s cubic-bezier(0.16,1,0.3,1) both; }
+    .spinner       { animation: spin    0.8s linear infinite; }
+    .pulse-ring    { animation: pulseRing 1.2s cubic-bezier(0.215,0.61,0.355,1) infinite; }
+
+    /* ── Toast ── */
+    #toast {
+      position: fixed;
+      bottom: 88px;
+      left: 50%;
+      transform: translateX(-50%) translateY(12px);
+      opacity: 0;
+      transition: all 0.3s cubic-bezier(0.16,1,0.3,1);
+      z-index: 9999;
+      pointer-events: none;
+      width: calc(100% - 32px);
+      max-width: 380px;
+    }
+    #toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+
+    /* ── Booking modal ── */
+    #booking-modal {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,0.45);
+      backdrop-filter: blur(6px);
+      z-index: 1000;
+      align-items: flex-end;
+      justify-content: center;
+      padding-bottom: env(safe-area-inset-bottom, 0);
+    }
+    #booking-modal.show { display: flex; }
+
+    /* ── Bottom nav ── */
+    #bottom-nav {
+      position: fixed;
+      bottom: 0;
+      left: 50%;
+      transform: translateX(-50%);
+      width: 100%;
+      max-width: 430px;
+      background: rgba(255,255,255,0.95);
+      backdrop-filter: blur(12px);
+      border-top: 1px solid #F3F2EF;
+      padding: 10px 0 calc(10px + env(safe-area-inset-bottom, 0));
+      z-index: 100;
+      display: none;
+    }
+    #bottom-nav.show { display: flex; justify-content: space-around; }
+
+    .nav-btn { display: flex; flex-direction: column; align-items: center; gap: 4px; padding: 4px 20px; border: none; background: none; cursor: pointer; }
+    .nav-btn svg       { color: #C8C4BE; transition: color 0.15s; }
+    .nav-btn span      { font-size: 10px; font-weight: 500; color: #C8C4BE; transition: color 0.15s; }
+    .nav-btn.active svg  { color: #1C1917; }
+    .nav-btn.active span { color: #1C1917; font-weight: 700; }
+
+    /* ── Inputs ── */
+    .field {
+      width: 100%;
+      padding: 14px 16px;
+      border-radius: 16px;
+      border: 1.5px solid #E7E5E4;
+      font-size: 15px;
+      color: #1C1917;
+      background: #fff;
+      font-family: 'Inter', sans-serif;
+      transition: border-color 0.15s, box-shadow 0.15s;
+      outline: none;
+    }
+    .field:focus { border-color: #1C1917; box-shadow: 0 0 0 3px rgba(28,25,23,0.06); }
+    .field::placeholder { color: #C8C4BE; }
+
+    /* ── Buttons ── */
+    .btn-primary {
+      width: 100%;
+      padding: 15px 24px;
+      background: #1C1917;
+      color: #fff;
+      font-size: 15px;
+      font-weight: 600;
+      border-radius: 16px;
+      border: none;
+      cursor: pointer;
+      font-family: 'Inter', sans-serif;
+      transition: opacity 0.15s, transform 0.1s;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+    }
+    .btn-primary:active  { opacity: 0.85; transform: scale(0.99); }
+    .btn-primary:disabled { opacity: 0.45; cursor: not-allowed; transform: none; }
+
+    .btn-ghost {
+      width: 100%;
+      padding: 15px 24px;
+      background: transparent;
+      color: #1C1917;
+      font-size: 15px;
+      font-weight: 600;
+      border-radius: 16px;
+      border: 1.5px solid #E7E5E4;
+      cursor: pointer;
+      font-family: 'Inter', sans-serif;
+      transition: background 0.15s;
+    }
+    .btn-ghost:active { background: #F5F4F2; }
+
+    /* ── Cards ── */
+    .card {
+      background: #fff;
+      border-radius: 24px;
+      border: 1px solid #F0EEE9;
+      box-shadow: 0 1px 4px rgba(0,0,0,0.04);
+      padding: 20px;
+      cursor: pointer;
+      transition: transform 0.15s, box-shadow 0.15s;
+    }
+    .card:active { transform: scale(0.985); box-shadow: none; }
+    .card.no-click { cursor: default; }
+    .card.no-click:active { transform: none; box-shadow: 0 1px 4px rgba(0,0,0,0.04); }
+
+    /* ── Status badges ── */
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      font-size: 11px;
+      font-weight: 700;
+      padding: 4px 10px;
+      border-radius: 999px;
+      letter-spacing: 0.02em;
+      text-transform: uppercase;
+    }
+    .badge-pending   { background: #FEF3C7; color: #92400E; }
+    .badge-confirmed { background: #D1FAE5; color: #065F46; }
+    .badge-failed    { background: #FEE2E2; color: #991B1B; }
+    .badge-category  { background: #F3F2EF; color: #57534E; }
+    .badge-seats     { background: #ECFDF5; color: #065F46; }
+    .badge-seats.low { background: #FEF3C7; color: #92400E; }
+    .badge-seats.full { background: #FEE2E2; color: #991B1B; }
+
+    /* ── Scrollbar ── */
+    .scroll { overflow-y: auto; -webkit-overflow-scrolling: touch; }
+    .scroll::-webkit-scrollbar { display: none; }
+
+    /* ── Label ── */
+    .label {
+      display: block;
+      font-size: 11px;
+      font-weight: 700;
+      color: #A8A29E;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      margin-bottom: 6px;
+    }
+
+    /* ── Error box ── */
+    .error-box {
+      background: #FEF2F2;
+      border: 1px solid #FECACA;
+      border-radius: 14px;
+      padding: 12px 14px;
+      font-size: 13px;
+      color: #B91C1C;
+      display: none;
+    }
+    .error-box.show { display: block; }
+  </style>
+</head>
+
+<body>
+
+<!-- =====================================================================
+     TOAST
+===================================================================== -->
+<div id="toast">
+  <div id="toast-inner" style="border-radius:16px; padding:12px 16px; font-size:14px; font-weight:600; display:flex; align-items:center; gap:10px; box-shadow:0 4px 20px rgba(0,0,0,0.15);">
+    <span id="toast-icon" style="font-size:16px;"></span>
+    <span id="toast-msg"></span>
+  </div>
+</div>
+
+<!-- =====================================================================
+     BOOKING STATUS MODAL
+===================================================================== -->
+<div id="booking-modal" onclick="handleModalBackdrop(event)">
+  <div class="anim-slide-up" style="background:#fff; border-radius:32px 32px 0 0; width:100%; max-width:430px; padding:32px 24px calc(32px + env(safe-area-inset-bottom,0)); text-align:center;">
+
+    <!-- Pending -->
+    <div id="modal-pending">
+      <div style="position:relative; width:80px; height:80px; margin:0 auto 24px;">
+        <div class="pulse-ring" style="position:absolute; inset:0; border-radius:50%; background:#FEF3C7;"></div>
+        <div style="position:relative; width:80px; height:80px; border-radius:50%; background:#FFFBEB; display:flex; align-items:center; justify-content:center;">
+          <svg class="spinner" width="32" height="32" viewBox="0 0 24 24" fill="none">
+            <circle cx="12" cy="12" r="10" stroke="#F59E0B" stroke-width="3" stroke-opacity="0.25"/>
+            <path d="M4 12a8 8 0 018-8" stroke="#F59E0B" stroke-width="3" stroke-linecap="round" fill="none"/>
+          </svg>
+        </div>
+      </div>
+      <h3 style="font-size:20px; font-weight:700; color:#1C1917; margin:0 0 6px;">Processing Booking</h3>
+      <p style="font-size:14px; color:#A8A29E; margin:0;">Your ticket is being prepared by the worker pool...</p>
+      <div style="margin-top:20px; padding:12px 16px; background:#F9F8F6; border-radius:14px;">
+        <p style="font-size:12px; color:#78716C; margin:0;">Polling status every 2s — <span id="poll-counter" style="font-weight:600; font-family:monospace;">0s</span></p>
+      </div>
+    </div>
+
+    <!-- Success -->
+    <div id="modal-success" style="display:none;">
+      <div style="width:80px; height:80px; border-radius:50%; background:#ECFDF5; display:flex; align-items:center; justify-content:center; margin:0 auto 24px;">
+        <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="#10B981" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M5 13l4 4L19 7"/>
+        </svg>
+      </div>
+      <h3 style="font-size:20px; font-weight:700; color:#1C1917; margin:0 0 6px;">Booking Confirmed!</h3>
+      <p style="font-size:14px; color:#A8A29E; margin:0 0 28px;">Your ticket has been secured. Check your tickets below.</p>
+      <button class="btn-primary" onclick="closeBookingModal()">View My Tickets</button>
+    </div>
+
+    <!-- Failed -->
+    <div id="modal-failed" style="display:none;">
+      <div style="width:80px; height:80px; border-radius:50%; background:#FEF2F2; display:flex; align-items:center; justify-content:center; margin:0 auto 24px;">
+        <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="#EF4444" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M18 6L6 18M6 6l12 12"/>
+        </svg>
+      </div>
+      <h3 style="font-size:20px; font-weight:700; color:#1C1917; margin:0 0 6px;">Booking Failed</h3>
+      <p id="modal-fail-msg" style="font-size:14px; color:#A8A29E; margin:0 0 28px;">Something went wrong. Please try again.</p>
+      <button class="btn-primary" onclick="closeBookingModal()">Close</button>
+    </div>
+  </div>
+</div>
+
+<!-- =====================================================================
+     BOTTOM NAV
+===================================================================== -->
+<nav id="bottom-nav">
+  <button class="nav-btn" data-nav="events" onclick="navigate('events')">
+    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M3 9l9-7 9 7v11a2 2 0 01-2 2H5a2 2 0 01-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/>
+    </svg>
+    <span>Home</span>
+  </button>
+  <button class="nav-btn" data-nav="bookings" onclick="navigate('bookings')">
+    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M20 12v10H4V12"/><path d="M22 7H2v5h20V7z"/><path d="M12 22V7"/><path d="M12 7H7.5a2.5 2.5 0 010-5C11 2 12 7 12 7z"/><path d="M12 7h4.5a2.5 2.5 0 000-5C13 2 12 7 12 7z"/>
+    </svg>
+    <span>Tickets</span>
+  </button>
+  <button class="nav-btn" data-nav="profile" onclick="navigate('profile')">
+    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M20 21v-2a4 4 0 00-4-4H8a4 4 0 00-4 4v2"/><circle cx="12" cy="7" r="4"/>
+    </svg>
+    <span>Profile</span>
+  </button>
+</nav>
+
+<!-- =====================================================================
+     SCREEN: AUTH
+===================================================================== -->
+<div id="screen-auth" class="screen">
+  <div style="flex:1; display:flex; flex-direction:column; padding:48px 24px 40px;">
+
+    <!-- Brand -->
+    <div style="margin-bottom:36px;">
+      <div style="width:48px; height:48px; background:#1C1917; border-radius:16px; display:flex; align-items:center; justify-content:center; margin-bottom:20px;">
+        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="3" y="4" width="18" height="18" rx="2" ry="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/>
+        </svg>
+      </div>
+      <h1 id="auth-title" style="font-size:26px; font-weight:700; color:#1C1917; margin:0 0 4px;">Welcome back</h1>
+      <p id="auth-subtitle" style="font-size:14px; color:#A8A29E; margin:0;">Sign in to access your events</p>
+    </div>
+
+    <!-- Tab toggle -->
+    <div style="display:flex; background:#F3F2EF; border-radius:16px; padding:4px; margin-bottom:28px;">
+      <button id="tab-login" onclick="switchTab('login')"
+        style="flex:1; padding:10px; border-radius:12px; border:none; font-size:14px; font-weight:600; font-family:'Inter',sans-serif; cursor:pointer; transition:all 0.2s; background:#fff; color:#1C1917; box-shadow:0 1px 4px rgba(0,0,0,0.08);">
+        Sign In
+      </button>
+      <button id="tab-register" onclick="switchTab('register')"
+        style="flex:1; padding:10px; border-radius:12px; border:none; font-size:14px; font-weight:600; font-family:'Inter',sans-serif; cursor:pointer; transition:all 0.2s; background:transparent; color:#A8A29E;">
+        Register
+      </button>
+    </div>
+
+    <!-- Login form -->
+    <form id="form-login" onsubmit="handleLogin(event)" style="display:flex; flex-direction:column; gap:16px;">
+      <div>
+        <label class="label">Email</label>
+        <input id="login-email" type="email" class="field" placeholder="you@example.com" required autocomplete="email" />
+      </div>
+      <div>
+        <label class="label">Password</label>
+        <input id="login-password" type="password" class="field" placeholder="••••••••" required autocomplete="current-password" />
+      </div>
+      <div id="login-error" class="error-box"></div>
+      <button id="btn-login" type="submit" class="btn-primary" style="margin-top:4px;">Sign In</button>
+    </form>
+
+    <!-- Register form -->
+    <form id="form-register" onsubmit="handleRegister(event)" style="display:none; flex-direction:column; gap:16px;">
+      <div>
+        <label class="label">Full Name</label>
+        <input id="reg-name" type="text" class="field" placeholder="Your full name" required autocomplete="name" />
+      </div>
+      <div>
+        <label class="label">Email</label>
+        <input id="reg-email" type="email" class="field" placeholder="you@example.com" required autocomplete="email" />
+      </div>
+      <div>
+        <label class="label">Password</label>
+        <input id="reg-password" type="password" class="field" placeholder="Min. 6 characters" required minlength="6" autocomplete="new-password" />
+      </div>
+      <div id="reg-error" class="error-box"></div>
+      <button id="btn-register" type="submit" class="btn-primary" style="margin-top:4px;">Create Account</button>
+    </form>
+
+  </div>
+</div>
+
+<!-- =====================================================================
+     SCREEN: EVENTS
+===================================================================== -->
+<div id="screen-events" class="screen">
+
+  <!-- Header -->
+  <div style="padding:52px 20px 16px; background:#FAFAF9;">
+    <div style="display:flex; align-items:center; justify-content:space-between;">
+      <div>
+        <p style="font-size:13px; color:#A8A29E; margin:0 0 2px;">
+          Hello, <span id="greeting-name" style="color:#78716C; font-weight:600;"></span>
+        </p>
+        <h2 style="font-size:22px; font-weight:700; color:#1C1917; margin:0;">Discover Events</h2>
+      </div>
+      <div id="avatar-events" style="width:42px; height:42px; border-radius:14px; background:#1C1917; display:flex; align-items:center; justify-content:center; font-size:16px; font-weight:700; color:#fff;"></div>
+    </div>
+  </div>
+
+  <!-- List -->
+  <div class="scroll" style="flex:1; padding:8px 20px 100px;">
+    <div id="events-loading" style="display:flex; justify-content:center; padding:48px 0;">
+      <svg class="spinner" width="28" height="28" viewBox="0 0 24 24" fill="none">
+        <circle cx="12" cy="12" r="10" stroke="#D6D3D1" stroke-width="3"/>
+        <path d="M4 12a8 8 0 018-8" stroke="#1C1917" stroke-width="3" stroke-linecap="round" fill="none"/>
+      </svg>
+    </div>
+    <div id="events-list" style="display:none; flex-direction:column; gap:14px;"></div>
+    <div id="events-empty" style="display:none; text-align:center; padding:64px 0;">
+      <div style="font-size:40px; margin-bottom:12px;">📭</div>
+      <p style="font-size:16px; font-weight:600; color:#1C1917; margin:0 0 4px;">No events yet</p>
+      <p style="font-size:13px; color:#A8A29E; margin:0;">Check back later or seed your database.</p>
+    </div>
+    <div id="events-error" style="display:none; text-align:center; padding:64px 0;">
+      <p style="font-size:14px; color:#EF4444; margin:0 0 12px;" id="events-error-msg">Failed to load events</p>
+      <button onclick="loadEvents()" style="font-size:13px; font-weight:600; color:#1C1917; background:none; border:none; cursor:pointer; text-decoration:underline;">Retry</button>
+    </div>
+  </div>
+
+</div>
+
+<!-- =====================================================================
+     SCREEN: EVENT DETAIL
+===================================================================== -->
+<div id="screen-event-detail" class="screen">
+
+  <!-- Top bar -->
+  <div style="padding:52px 20px 12px; display:flex; align-items:center; gap:12px; background:#FAFAF9;">
+    <button onclick="navigate('events')" style="width:40px; height:40px; border-radius:14px; background:#F3F2EF; border:none; cursor:pointer; display:flex; align-items:center; justify-content:center;">
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#1C1917" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+        <polyline points="15 18 9 12 15 6"/>
+      </svg>
+    </button>
+    <span style="font-size:14px; font-weight:600; color:#78716C;">Event Details</span>
+  </div>
+
+  <!-- Content -->
+  <div class="scroll" style="flex:1; padding:0 20px 140px;" id="detail-content"></div>
+
+  <!-- Action bar -->
+  <div id="detail-action-bar" style="position:fixed; bottom:0; left:50%; transform:translateX(-50%); width:100%; max-width:430px; background:rgba(255,255,255,0.95); backdrop-filter:blur(12px); border-top:1px solid #F3F2EF; padding:16px 20px calc(16px + env(safe-area-inset-bottom,0)); z-index:50;">
+    <button id="btn-book" onclick="handleBook()" class="btn-primary">Book Ticket</button>
+    <p id="auth-hint" style="display:none; text-align:center; font-size:13px; color:#A8A29E; margin:10px 0 0;">
+      <button onclick="navigate('auth')" style="background:none; border:none; font-size:13px; font-weight:700; color:#1C1917; cursor:pointer; text-decoration:underline;">Sign in</button>
+      to book this event
+    </p>
+  </div>
+
+</div>
+
+<!-- =====================================================================
+     SCREEN: BOOKINGS
+===================================================================== -->
+<div id="screen-bookings" class="screen">
+
+  <div style="padding:52px 20px 16px;">
+    <h2 style="font-size:22px; font-weight:700; color:#1C1917; margin:0 0 4px;">My Tickets</h2>
+    <p style="font-size:13px; color:#A8A29E; margin:0;">Your booked events</p>
+  </div>
+
+  <div class="scroll" style="flex:1; padding:8px 20px 100px;">
+    <div id="bookings-loading" style="display:flex; justify-content:center; padding:48px 0;">
+      <svg class="spinner" width="28" height="28" viewBox="0 0 24 24" fill="none">
+        <circle cx="12" cy="12" r="10" stroke="#D6D3D1" stroke-width="3"/>
+        <path d="M4 12a8 8 0 018-8" stroke="#1C1917" stroke-width="3" stroke-linecap="round" fill="none"/>
+      </svg>
+    </div>
+    <div id="bookings-list" style="display:none; flex-direction:column; gap:14px;"></div>
+    <div id="bookings-empty" style="display:none; text-align:center; padding:64px 0;">
+      <div style="width:64px; height:64px; background:#F3F2EF; border-radius:20px; display:flex; align-items:center; justify-content:center; margin:0 auto 16px;">
+        <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="#A8A29E" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M20 12v10H4V12"/><path d="M22 7H2v5h20V7z"/><path d="M12 22V7"/>
+          <path d="M12 7H7.5a2.5 2.5 0 010-5C11 2 12 7 12 7z"/><path d="M12 7h4.5a2.5 2.5 0 000-5C13 2 12 7 12 7z"/>
+        </svg>
+      </div>
+      <p style="font-size:16px; font-weight:600; color:#1C1917; margin:0 0 6px;">No tickets yet</p>
+      <p style="font-size:13px; color:#A8A29E; margin:0 0 20px;">Book an event to see your tickets here.</p>
+      <button onclick="navigate('events')" style="background:#1C1917; color:#fff; border:none; border-radius:14px; padding:12px 24px; font-size:14px; font-weight:600; font-family:'Inter',sans-serif; cursor:pointer;">Browse Events</button>
+    </div>
+  </div>
+
+</div>
+
+<!-- =====================================================================
+     SCREEN: PROFILE
+===================================================================== -->
+<div id="screen-profile" class="screen">
+
+  <div style="padding:52px 20px 20px;">
+    <h2 style="font-size:22px; font-weight:700; color:#1C1917; margin:0;">Profile</h2>
+  </div>
+
+  <div class="scroll" style="flex:1; padding:0 20px 100px; display:flex; flex-direction:column; gap:16px;">
+
+    <!-- User card -->
+    <div class="card no-click" style="display:flex; align-items:center; gap:16px;">
+      <div id="profile-avatar" style="width:56px; height:56px; border-radius:18px; background:#1C1917; display:flex; align-items:center; justify-content:center; font-size:22px; font-weight:700; color:#fff; flex-shrink:0;"></div>
+      <div>
+        <p id="profile-name" style="font-size:17px; font-weight:700; color:#1C1917; margin:0 0 3px;"></p>
+        <p id="profile-email" style="font-size:13px; color:#A8A29E; margin:0;"></p>
+      </div>
+    </div>
+
+    <!-- API config -->
+    <div class="card no-click">
+      <p style="font-size:13px; font-weight:700; color:#78716C; margin:0 0 14px;">Backend Configuration</p>
+      <label class="label">API Base URL</label>
+      <div style="display:flex; gap:8px; align-items:center;">
+        <input id="api-url-input" type="text" class="field" style="flex:1; font-family:monospace; font-size:13px;" placeholder="http://localhost:8080" />
+        <button onclick="saveApiUrl()" style="padding:14px 16px; background:#1C1917; color:#fff; border:none; border-radius:14px; font-size:13px; font-weight:700; font-family:'Inter',sans-serif; cursor:pointer; white-space:nowrap;">Save</button>
+      </div>
+      <p style="font-size:11px; color:#C8C4BE; margin:8px 0 0;">Active: <span id="api-url-display" style="font-family:monospace; color:#78716C;"></span></p>
+    </div>
+
+    <!-- Stats -->
+    <div class="card no-click" style="display:grid; grid-template-columns:1fr 1fr; gap:12px;">
+      <div style="text-align:center; padding:12px; background:#F9F8F6; border-radius:16px;">
+        <p id="stat-total" style="font-size:28px; font-weight:700; color:#1C1917; margin:0 0 2px;">—</p>
+        <p style="font-size:11px; color:#A8A29E; font-weight:600; text-transform:uppercase; letter-spacing:0.05em; margin:0;">Total Bookings</p>
+      </div>
+      <div style="text-align:center; padding:12px; background:#F9F8F6; border-radius:16px;">
+        <p id="stat-confirmed" style="font-size:28px; font-weight:700; color:#10B981; margin:0 0 2px;">—</p>
+        <p style="font-size:11px; color:#A8A29E; font-weight:600; text-transform:uppercase; letter-spacing:0.05em; margin:0;">Confirmed</p>
+      </div>
+    </div>
+
+    <!-- Logout -->
+    <button onclick="handleLogout()" style="width:100%; padding:15px; background:#FEF2F2; color:#DC2626; border:1px solid #FECACA; border-radius:16px; font-size:15px; font-weight:700; font-family:'Inter',sans-serif; cursor:pointer; transition:background 0.15s;"
+      onmouseover="this.style.background='#FEE2E2'" onmouseout="this.style.background='#FEF2F2'">
+      Sign Out
+    </button>
+
+  </div>
+</div>
+
+<!-- =====================================================================
+     JAVASCRIPT
+===================================================================== -->
+<script>
+// ── Config ──────────────────────────────────────────────────────────────
+// Students: update this to match your backend port/host
+let API_BASE = localStorage.getItem('api_base') || 'http://localhost:8080';
+
+// ── State ────────────────────────────────────────────────────────────────
+const state = {
+  token: localStorage.getItem('token'),
+  user:  (() => { try { return JSON.parse(localStorage.getItem('user')); } catch { return null; } })(),
+  events: [],
+  currentEventId: null,
+  pollingTimer: null,
+  pollCount: 0,
+  pollCountTimer: null,
+};
+
+// ── API Helper ───────────────────────────────────────────────────────────
+async function api(method, path, body) {
+  const headers = { 'Content-Type': 'application/json' };
+  if (state.token) headers['Authorization'] = `Bearer ${state.token}`;
+
+  let res;
+  try {
+    res = await fetch(`${API_BASE}${path}`, {
+      method,
+      headers,
+      body: body !== undefined ? JSON.stringify(body) : undefined,
+    });
+  } catch (e) {
+    throw new Error(`Cannot reach backend at ${API_BASE}. Check that your server is running and CORS is enabled.`);
+  }
+
+  const data = await res.json().catch(() => ({}));
+
+  if (res.status === 429) throw new Error('Rate limited — slow down and try again.');
+  if (res.status === 401) {
+    clearAuth();
+    navigate('auth');
+    throw new Error('Session expired. Please sign in again.');
+  }
+  if (!res.ok) throw new Error(data.error || data.message || `Server error ${res.status}`);
+  return data;
+}
+
+// ── Router ───────────────────────────────────────────────────────────────
+let currentScreen = null;
+
+function navigate(name) {
+  if (name !== 'event-detail') stopPolling();
+
+  // Guard protected routes
+  if ((name === 'bookings' || name === 'profile') && !state.token) {
+    navigate('auth');
+    return;
+  }
+
+  document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
+  const s = document.getElementById(`screen-${name}`);
+  if (!s) return;
+  s.classList.add('active');
+  s.style.animation = 'none';
+  s.offsetHeight; // reflow
+  s.style.animation = 'fadeUp 0.25s cubic-bezier(0.16,1,0.3,1) both';
+
+  currentScreen = name;
+
+  // Bottom nav visibility
+  const showNav = state.token && name !== 'auth' && name !== 'event-detail';
+  document.getElementById('bottom-nav').classList.toggle('show', showNav);
+
+  // Update nav active state
+  document.querySelectorAll('.nav-btn').forEach(btn => {
+    btn.classList.toggle('active', btn.dataset.nav === name);
+  });
+
+  // Screen-specific init
+  if (name === 'events')   loadEvents();
+  if (name === 'bookings') loadBookings();
+  if (name === 'profile')  initProfile();
+}
+
+// ── Auth Tab Switch ──────────────────────────────────────────────────────
+function switchTab(tab) {
+  const isLogin = tab === 'login';
+
+  const tl = document.getElementById('tab-login');
+  const tr = document.getElementById('tab-register');
+  const fl = document.getElementById('form-login');
+  const fr = document.getElementById('form-register');
+
+  tl.style.cssText = isLogin
+    ? 'flex:1;padding:10px;border-radius:12px;border:none;font-size:14px;font-weight:600;font-family:Inter,sans-serif;cursor:pointer;transition:all 0.2s;background:#fff;color:#1C1917;box-shadow:0 1px 4px rgba(0,0,0,0.08);'
+    : 'flex:1;padding:10px;border-radius:12px;border:none;font-size:14px;font-weight:600;font-family:Inter,sans-serif;cursor:pointer;transition:all 0.2s;background:transparent;color:#A8A29E;';
+  tr.style.cssText = isLogin
+    ? 'flex:1;padding:10px;border-radius:12px;border:none;font-size:14px;font-weight:600;font-family:Inter,sans-serif;cursor:pointer;transition:all 0.2s;background:transparent;color:#A8A29E;'
+    : 'flex:1;padding:10px;border-radius:12px;border:none;font-size:14px;font-weight:600;font-family:Inter,sans-serif;cursor:pointer;transition:all 0.2s;background:#fff;color:#1C1917;box-shadow:0 1px 4px rgba(0,0,0,0.08);';
+
+  fl.style.display = isLogin ? 'flex' : 'none';
+  fr.style.display = isLogin ? 'none' : 'flex';
+
+  document.getElementById('auth-title').textContent    = isLogin ? 'Welcome back'              : 'Create account';
+  document.getElementById('auth-subtitle').textContent = isLogin ? 'Sign in to access events' : 'Join and start booking events';
+}
+
+// ── Login ────────────────────────────────────────────────────────────────
+async function handleLogin(e) {
+  e.preventDefault();
+  const errEl = document.getElementById('login-error');
+  errEl.classList.remove('show');
+  const btn = document.getElementById('btn-login');
+  setLoading(btn, true, 'Signing in...');
+
+  try {
+    const data = await api('POST', '/api/login', {
+      email:    document.getElementById('login-email').value.trim(),
+      password: document.getElementById('login-password').value,
+    });
+    persistAuth(data.token, data.user);
+    navigate('events');
+    toast('Welcome back!', 'success');
+  } catch (err) {
+    errEl.textContent = err.message;
+    errEl.classList.add('show');
+  } finally {
+    setLoading(btn, false, 'Sign In');
+  }
+}
+
+// ── Register ─────────────────────────────────────────────────────────────
+async function handleRegister(e) {
+  e.preventDefault();
+  const errEl = document.getElementById('reg-error');
+  errEl.classList.remove('show');
+  const btn = document.getElementById('btn-register');
+  setLoading(btn, true, 'Creating account...');
+
+  try {
+    const data = await api('POST', '/api/register', {
+      name:     document.getElementById('reg-name').value.trim(),
+      email:    document.getElementById('reg-email').value.trim(),
+      password: document.getElementById('reg-password').value,
+    });
+    persistAuth(data.token, data.user);
+    navigate('events');
+    toast('Account created!', 'success');
+  } catch (err) {
+    errEl.textContent = err.message;
+    errEl.classList.add('show');
+  } finally {
+    setLoading(btn, false, 'Create Account');
+  }
+}
+
+// ── Logout ───────────────────────────────────────────────────────────────
+function handleLogout() {
+  clearAuth();
+  navigate('auth');
+  toast('Signed out', 'info');
+}
+
+function persistAuth(token, user) {
+  state.token = token;
+  state.user  = user;
+  localStorage.setItem('token', token);
+  localStorage.setItem('user',  JSON.stringify(user));
+}
+
+function clearAuth() {
+  state.token = null;
+  state.user  = null;
+  localStorage.removeItem('token');
+  localStorage.removeItem('user');
+}
+
+// ── Events List ──────────────────────────────────────────────────────────
+async function loadEvents() {
+  const elLoading = document.getElementById('events-loading');
+  const elList    = document.getElementById('events-list');
+  const elEmpty   = document.getElementById('events-empty');
+  const elError   = document.getElementById('events-error');
+
+  elLoading.style.display = 'flex';
+  elList.style.display    = 'none';
+  elEmpty.style.display   = 'none';
+  elError.style.display   = 'none';
+
+  // Greeting
+  if (state.user) {
+    const first = (state.user.name || 'there').split(' ')[0];
+    document.getElementById('greeting-name').textContent = first;
+    document.getElementById('avatar-events').textContent = first[0].toUpperCase();
+  }
+
+  try {
+    const events = await api('GET', '/api/events');
+    state.events = events || [];
+    elLoading.style.display = 'none';
+
+    if (!state.events.length) {
+      elEmpty.style.display = 'block';
+      return;
+    }
+
+    elList.innerHTML = state.events.map(renderEventCard).join('');
+    elList.style.display = 'flex';
+  } catch (err) {
+    elLoading.style.display = 'none';
+    document.getElementById('events-error-msg').textContent = err.message;
+    elError.style.display = 'block';
+  }
+}
+
+function renderEventCard(ev) {
+  const seats   = parseInt(ev.available_seats ?? ev.availableSeats ?? 0);
+  const seatCls = seats === 0 ? 'full' : seats <= 10 ? 'low' : '';
+  const seatTxt = seats === 0 ? 'Sold Out' : `${seats} left`;
+  const dateStr = ev.date ? fmtDate(ev.date) : 'TBA';
+  const price   = ev.price ? `Rp ${Number(ev.price).toLocaleString('id-ID')}` : 'Free';
+  const id      = ev.id || ev.ID;
+
+  return `
+  <div class="card anim-fade-up" onclick="openEventDetail('${esc(String(id))}')">
+    <div style="display:flex; justify-content:space-between; align-items:flex-start; margin-bottom:12px; gap:8px;">
+      <span class="badge badge-category">${esc(ev.category || 'Event')}</span>
+      <span class="badge badge-seats ${seatCls}">${seatTxt}</span>
+    </div>
+    <h3 style="font-size:16px; font-weight:700; color:#1C1917; margin:0 0 12px; line-height:1.35;">${esc(ev.title || ev.name || 'Untitled')}</h3>
+    <div style="display:flex; flex-direction:column; gap:6px; margin-bottom:14px;">
+      <div style="display:flex; align-items:center; gap:8px; font-size:13px; color:#78716C;">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink:0;">
+          <rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/>
+        </svg>
+        ${esc(dateStr)}
+      </div>
+      <div style="display:flex; align-items:center; gap:8px; font-size:13px; color:#78716C;">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink:0;">
+          <path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0118 0z"/><circle cx="12" cy="10" r="3"/>
+        </svg>
+        ${esc(ev.location || 'Online')}
+      </div>
+    </div>
+    <div style="display:flex; justify-content:space-between; align-items:center; padding-top:14px; border-top:1px solid #F3F2EF;">
+      <span style="font-size:15px; font-weight:700; color:#1C1917;">${price}</span>
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#C8C4BE" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+        <polyline points="9 18 15 12 9 6"/>
+      </svg>
+    </div>
+  </div>`;
+}
+
+// ── Event Detail ─────────────────────────────────────────────────────────
+function openEventDetail(id) {
+  const ev = state.events.find(e => String(e.id || e.ID) === String(id));
+  if (!ev) { toast('Event not found', 'error'); return; }
+
+  state.currentEventId = id;
+  const seats   = parseInt(ev.available_seats ?? ev.availableSeats ?? 0);
+  const soldOut = seats === 0;
+  const price   = ev.price ? `Rp ${Number(ev.price).toLocaleString('id-ID')}` : 'Free';
+
+  document.getElementById('detail-content').innerHTML = `
+  <div class="anim-fade-up" style="padding-top:8px;">
+    <span class="badge badge-category" style="margin-bottom:16px; display:inline-flex;">${esc(ev.category || 'Event')}</span>
+    <h1 style="font-size:24px; font-weight:800; color:#1C1917; margin:0 0 24px; line-height:1.25;">${esc(ev.title || ev.name || 'Event')}</h1>
+
+    <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-bottom:24px;">
+      <div style="background:#F9F8F6; border-radius:18px; padding:16px;">
+        <p style="font-size:10px; font-weight:700; text-transform:uppercase; letter-spacing:0.06em; color:#A8A29E; margin:0 0 4px;">Date</p>
+        <p style="font-size:13px; font-weight:600; color:#1C1917; margin:0; line-height:1.4;">${esc(ev.date ? fmtDate(ev.date) : 'TBA')}</p>
+      </div>
+      <div style="background:#F9F8F6; border-radius:18px; padding:16px;">
+        <p style="font-size:10px; font-weight:700; text-transform:uppercase; letter-spacing:0.06em; color:#A8A29E; margin:0 0 4px;">Location</p>
+        <p style="font-size:13px; font-weight:600; color:#1C1917; margin:0; line-height:1.4;">${esc(ev.location || 'Online')}</p>
+      </div>
+      <div style="background:#F9F8F6; border-radius:18px; padding:16px;">
+        <p style="font-size:10px; font-weight:700; text-transform:uppercase; letter-spacing:0.06em; color:#A8A29E; margin:0 0 4px;">Seats Left</p>
+        <p style="font-size:13px; font-weight:600; color:${soldOut ? '#DC2626' : '#1C1917'}; margin:0;">${soldOut ? 'Sold Out' : seats}</p>
+      </div>
+      <div style="background:#F9F8F6; border-radius:18px; padding:16px;">
+        <p style="font-size:10px; font-weight:700; text-transform:uppercase; letter-spacing:0.06em; color:#A8A29E; margin:0 0 4px;">Price</p>
+        <p style="font-size:13px; font-weight:600; color:#1C1917; margin:0;">${price}</p>
+      </div>
+    </div>
+
+    ${ev.description ? `
+    <div style="margin-bottom:24px;">
+      <p style="font-size:12px; font-weight:700; text-transform:uppercase; letter-spacing:0.06em; color:#A8A29E; margin:0 0 8px;">About</p>
+      <p style="font-size:14px; color:#57534E; line-height:1.65; margin:0;">${esc(ev.description)}</p>
+    </div>` : ''}
+
+    ${parseInt(ev.capacity) ? `
+    <div style="margin-bottom:24px; padding:16px; background:#F9F8F6; border-radius:18px;">
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+        <p style="font-size:12px; font-weight:600; color:#78716C; margin:0;">Capacity</p>
+        <p style="font-size:12px; font-weight:700; color:#1C1917; margin:0;">${seats} / ${ev.capacity}</p>
+      </div>
+      <div style="height:6px; background:#E7E5E4; border-radius:999px; overflow:hidden;">
+        <div style="height:100%; background:${soldOut ? '#EF4444' : '#1C1917'}; border-radius:999px; width:${Math.round((1 - seats / parseInt(ev.capacity)) * 100)}%;"></div>
+      </div>
+    </div>` : ''}
+  </div>`;
+
+  // Update action bar
+  const btnBook  = document.getElementById('btn-book');
+  const authHint = document.getElementById('auth-hint');
+
+  if (!state.token) {
+    btnBook.style.display  = 'none';
+    authHint.style.display = 'block';
+  } else if (soldOut) {
+    btnBook.style.display  = '';
+    authHint.style.display = 'none';
+    btnBook.textContent    = 'Sold Out';
+    btnBook.disabled       = true;
+  } else {
+    btnBook.style.display  = '';
+    authHint.style.display = 'none';
+    btnBook.textContent    = 'Book Ticket';
+    btnBook.disabled       = false;
+  }
+
+  navigate('event-detail');
+}
+
+// ── Book ─────────────────────────────────────────────────────────────────
+async function handleBook() {
+  const ev = state.events.find(e => String(e.id || e.ID) === String(state.currentEventId));
+  if (!ev) return;
+
+  const btn = document.getElementById('btn-book');
+  setLoading(btn, true, 'Booking...');
+
+  try {
+    const res = await api('POST', `/api/events/${state.currentEventId}/book`);
+    setLoading(btn, false, 'Book Ticket');
+    openBookingModal(res.booking_id || res.bookingId || res.id);
+  } catch (err) {
+    setLoading(btn, false, 'Book Ticket');
+    toast(err.message, 'error');
+  }
+}
+
+// ── Booking Modal ─────────────────────────────────────────────────────────
+function openBookingModal(bookingId) {
+  document.getElementById('modal-pending').style.display = '';
+  document.getElementById('modal-success').style.display = 'none';
+  document.getElementById('modal-failed').style.display  = 'none';
+  document.getElementById('booking-modal').classList.add('show');
+  startPolling(bookingId);
+}
+
+function closeBookingModal() {
+  document.getElementById('booking-modal').classList.remove('show');
+  stopPolling();
+  navigate('bookings');
+}
+
+function handleModalBackdrop(e) {
+  if (e.target === document.getElementById('booking-modal')) {
+    // Don't allow closing while pending
+    const isPending = document.getElementById('modal-pending').style.display !== 'none';
+    if (!isPending) closeBookingModal();
+  }
+}
+
+function startPolling(bookingId) {
+  stopPolling();
+  state.pollCount = 0;
+  const MAX_POLLS = 30; // 60s
+
+  // Visible counter
+  const counter = document.getElementById('poll-counter');
+  state.pollCountTimer = setInterval(() => {
+    state.pollCount += 2;
+    if (counter) counter.textContent = `${state.pollCount}s`;
+  }, 2000);
+
+  state.pollingTimer = setInterval(async () => {
+    if (state.pollCount >= MAX_POLLS * 2) {
+      stopPolling();
+      showModalState('failed', 'Booking timed out. Please check your tickets manually.');
+      return;
+    }
+    try {
+      const b = await api('GET', `/api/bookings/${bookingId}`);
+      const s = (b.status || '').toLowerCase();
+      if (s === 'confirmed') { stopPolling(); showModalState('success'); }
+      if (s === 'failed' || s === 'cancelled') { stopPolling(); showModalState('failed', b.message || 'Booking could not be processed.'); }
+    } catch (_) { /* transient — keep polling */ }
+  }, 2000);
+}
+
+function stopPolling() {
+  if (state.pollingTimer)    { clearInterval(state.pollingTimer);    state.pollingTimer    = null; }
+  if (state.pollCountTimer)  { clearInterval(state.pollCountTimer);  state.pollCountTimer  = null; }
+}
+
+function showModalState(type, msg) {
+  document.getElementById('modal-pending').style.display = 'none';
+  document.getElementById('modal-success').style.display = type === 'success' ? '' : 'none';
+  document.getElementById('modal-failed').style.display  = type === 'failed'  ? '' : 'none';
+  if (msg) document.getElementById('modal-fail-msg').textContent = msg;
+}
+
+// ── Bookings History ──────────────────────────────────────────────────────
+async function loadBookings() {
+  const elLoading = document.getElementById('bookings-loading');
+  const elList    = document.getElementById('bookings-list');
+  const elEmpty   = document.getElementById('bookings-empty');
+
+  elLoading.style.display = 'flex';
+  elList.style.display    = 'none';
+  elEmpty.style.display   = 'none';
+
+  try {
+    const bookings = await api('GET', '/api/bookings');
+    elLoading.style.display = 'none';
+
+    if (!bookings || !bookings.length) {
+      elEmpty.style.display = 'block';
+      return;
+    }
+
+    elList.innerHTML = bookings.map(renderBookingCard).join('');
+    elList.style.display = 'flex';
+  } catch (err) {
+    elLoading.style.display = 'none';
+    toast(err.message, 'error');
+  }
+}
+
+function renderBookingCard(b) {
+  const ev     = b.event || {};
+  const title  = ev.title || ev.name || b.event_title || 'Event';
+  const date   = ev.date ? fmtDate(ev.date) : (b.created_at ? fmtDate(b.created_at) : '—');
+  const loc    = ev.location || '';
+  const status = (b.status || 'pending').toLowerCase();
+  const badgeCls = status === 'confirmed' ? 'badge-confirmed' : status === 'pending' ? 'badge-pending' : 'badge-failed';
+  const badgeTxt = status.charAt(0).toUpperCase() + status.slice(1);
+  const id       = b.id || b.booking_id || b.bookingId || '—';
+
+  return `
+  <div class="card no-click">
+    <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:10px; margin-bottom:10px;">
+      <h3 style="font-size:15px; font-weight:700; color:#1C1917; margin:0; line-height:1.35; flex:1;">${esc(title)}</h3>
+      <span class="badge ${badgeCls}" style="flex-shrink:0;">${badgeTxt}</span>
+    </div>
+    ${date !== '—' ? `
+    <div style="display:flex; align-items:center; gap:6px; font-size:12px; color:#A8A29E; margin-bottom:4px;">
+      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/>
+      </svg>${esc(date)}
+    </div>` : ''}
+    ${loc ? `
+    <div style="display:flex; align-items:center; gap:6px; font-size:12px; color:#A8A29E; margin-bottom:4px;">
+      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0118 0z"/><circle cx="12" cy="10" r="3"/>
+      </svg>${esc(loc)}
+    </div>` : ''}
+    <div style="margin-top:12px; padding-top:12px; border-top:1px solid #F3F2EF;">
+      <span style="font-size:11px; color:#C8C4BE; font-family:monospace;">ID: ${esc(String(id))}</span>
+    </div>
+  </div>`;
+}
+
+// ── Profile ───────────────────────────────────────────────────────────────
+async function initProfile() {
+  const u = state.user || {};
+  const name  = u.name  || 'User';
+  const email = u.email || '';
+  const init  = name[0].toUpperCase();
+
+  document.getElementById('profile-avatar').textContent = init;
+  document.getElementById('profile-name').textContent   = name;
+  document.getElementById('profile-email').textContent  = email;
+  document.getElementById('api-url-input').value        = API_BASE;
+  document.getElementById('api-url-display').textContent = API_BASE;
+
+  // Load booking stats quietly
+  try {
+    const bookings = await api('GET', '/api/bookings');
+    const confirmed = (bookings || []).filter(b => (b.status || '').toLowerCase() === 'confirmed').length;
+    document.getElementById('stat-total').textContent     = bookings.length;
+    document.getElementById('stat-confirmed').textContent = confirmed;
+  } catch (_) {}
+}
+
+function saveApiUrl() {
+  const val = document.getElementById('api-url-input').value.trim().replace(/\/$/, '');
+  if (!val) return;
+  API_BASE = val;
+  localStorage.setItem('api_base', val);
+  document.getElementById('api-url-display').textContent = val;
+  toast('API URL updated', 'success');
+}
+
+// ── Utilities ─────────────────────────────────────────────────────────────
+function fmtDate(s) {
+  try {
+    const d = new Date(s);
+    if (isNaN(d)) return s;
+    return d.toLocaleDateString('en-GB', { day:'numeric', month:'short', year:'numeric' })
+      + ' · '
+      + d.toLocaleTimeString('en-GB', { hour:'2-digit', minute:'2-digit' });
+  } catch { return s; }
+}
+
+function esc(s) {
+  return String(s)
+    .replace(/&/g,'&amp;')
+    .replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;')
+    .replace(/'/g,'&#39;');
+}
+
+let toastTimer = null;
+function toast(msg, type = 'info') {
+  const el    = document.getElementById('toast');
+  const inner = document.getElementById('toast-inner');
+  const icon  = document.getElementById('toast-icon');
+  const msgEl = document.getElementById('toast-msg');
+
+  const cfg = {
+    success: { bg:'#14532D', icon:'✓' },
+    error:   { bg:'#7F1D1D', icon:'✕' },
+    info:    { bg:'#1C1917', icon:'·' },
+  }[type] || { bg:'#1C1917', icon:'·' };
+
+  inner.style.background = cfg.bg;
+  inner.style.color      = '#fff';
+  icon.textContent       = cfg.icon;
+  msgEl.textContent      = msg;
+
+  el.classList.add('show');
+  if (toastTimer) clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.classList.remove('show'), 3500);
+}
+
+function setLoading(btn, loading, label) {
+  btn.disabled = loading;
+  btn.innerHTML = loading
+    ? `<svg class="spinner" width="18" height="18" viewBox="0 0 24 24" fill="none">
+        <circle cx="12" cy="12" r="10" stroke="rgba(255,255,255,0.3)" stroke-width="3"/>
+        <path d="M4 12a8 8 0 018-8" stroke="#fff" stroke-width="3" stroke-linecap="round" fill="none"/>
+       </svg>${label}`
+    : label;
+}
+
+// ── Init ─────────────────────────────────────────────────────────────────
+navigate(state.token && state.user ? 'events' : 'auth');
+</script>
+</body>
+</html>
